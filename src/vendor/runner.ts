@@ -81,7 +81,14 @@ export class VendorSession {
 
       const proc = spawn(
         process.execPath,
-        ['--permission', `--allow-fs-read=${vendorsDirOf(this.file)}`, HOST_PATH],
+        [
+          '--permission',
+          // 允许读取宿主脚本本身（Linux 下 --permission 会拦脚本读取，否则子进程直接退出）
+          `--allow-fs-read=${HOST_PATH}`,
+          // 允许读取 vendor 目录（模块解析用）
+          `--allow-fs-read=${vendorsDirOf(this.file)}`,
+          HOST_PATH,
+        ],
         {
           stdio: ['pipe', 'pipe', 'pipe'],
           windowsHide: true,
@@ -92,18 +99,47 @@ export class VendorSession {
       )
       this.proc = proc
 
+      // 启动超时：子进程若因权限/加载失败而静默退出，避免 start() 永远不 settle
+      const startTimer = setTimeout(() => {
+        reject(new Error('vendor 子进程启动超时（10s）'))
+        try {
+          proc.kill()
+        } catch {
+          /* ignore */
+        }
+      }, 10000)
+
       proc.stdout.setEncoding('utf8')
-      proc.stdout.on('data', (chunk: string) => this.onData(chunk, resolve, reject))
+      proc.stdout.on('data', (chunk: string) =>
+        this.onData(
+          chunk,
+          () => {
+            clearTimeout(startTimer)
+            resolve()
+          },
+          (e) => {
+            clearTimeout(startTimer)
+            reject(e)
+          },
+        ),
+      )
       proc.stderr.setEncoding('utf8')
       proc.stderr.on('data', (chunk: string) => {
         const msg = chunk.toString().trim()
         if (msg && !/ExperimentalWarning/.test(msg)) this.logs.push(`[stderr] ${msg}`)
       })
-      proc.on('error', (err) => reject(err))
+      proc.on('error', (err) => {
+        clearTimeout(startTimer)
+        reject(err)
+      })
       proc.on('exit', (code) => {
+        // 尚未 loaded 就退出 → 拒绝启动 promise（否则 start() 挂死）
+        clearTimeout(startTimer)
+        const err = new Error(`vendor 子进程已退出（code ${code}）${this.logs.length ? '：' + this.logs.slice(-3).join(' | ') : ''}`)
+        reject(err)
         for (const p of this.pending.values()) {
           clearTimeout(p.timer)
-          p.reject(new Error(`vendor 子进程已退出（code ${code}）`))
+          p.reject(err)
         }
         this.pending.clear()
         this.proc = null

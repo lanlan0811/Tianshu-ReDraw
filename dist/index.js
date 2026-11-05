@@ -851,7 +851,14 @@ var VendorSession = class {
       const vendorId = this.file.split(/[\\/]/).pop()?.replace(/\.ts$/, "") ?? "vendor";
       const proc = spawn(
         process.execPath,
-        ["--permission", `--allow-fs-read=${vendorsDirOf(this.file)}`, HOST_PATH],
+        [
+          "--permission",
+          // 允许读取宿主脚本本身（Linux 下 --permission 会拦脚本读取，否则子进程直接退出）
+          `--allow-fs-read=${HOST_PATH}`,
+          // 允许读取 vendor 目录（模块解析用）
+          `--allow-fs-read=${vendorsDirOf(this.file)}`,
+          HOST_PATH
+        ],
         {
           stdio: ["pipe", "pipe", "pipe"],
           windowsHide: true,
@@ -861,18 +868,44 @@ var VendorSession = class {
         }
       );
       this.proc = proc;
+      const startTimer = setTimeout(() => {
+        reject(new Error("vendor \u5B50\u8FDB\u7A0B\u542F\u52A8\u8D85\u65F6\uFF0810s\uFF09"));
+        try {
+          proc.kill();
+        } catch {
+        }
+      }, 1e4);
       proc.stdout.setEncoding("utf8");
-      proc.stdout.on("data", (chunk) => this.onData(chunk, resolve, reject));
+      proc.stdout.on(
+        "data",
+        (chunk) => this.onData(
+          chunk,
+          () => {
+            clearTimeout(startTimer);
+            resolve();
+          },
+          (e) => {
+            clearTimeout(startTimer);
+            reject(e);
+          }
+        )
+      );
       proc.stderr.setEncoding("utf8");
       proc.stderr.on("data", (chunk) => {
         const msg = chunk.toString().trim();
         if (msg && !/ExperimentalWarning/.test(msg)) this.logs.push(`[stderr] ${msg}`);
       });
-      proc.on("error", (err2) => reject(err2));
+      proc.on("error", (err2) => {
+        clearTimeout(startTimer);
+        reject(err2);
+      });
       proc.on("exit", (code2) => {
+        clearTimeout(startTimer);
+        const err2 = new Error(`vendor \u5B50\u8FDB\u7A0B\u5DF2\u9000\u51FA\uFF08code ${code2}\uFF09${this.logs.length ? "\uFF1A" + this.logs.slice(-3).join(" | ") : ""}`);
+        reject(err2);
         for (const p of this.pending.values()) {
           clearTimeout(p.timer);
-          p.reject(new Error(`vendor \u5B50\u8FDB\u7A0B\u5DF2\u9000\u51FA\uFF08code ${code2}\uFF09`));
+          p.reject(err2);
         }
         this.pending.clear();
         this.proc = null;

@@ -1,0 +1,42 @@
+{
+  "$tpi": "1.0",
+  "kind": "tianshu.plugin",
+  "id": "tianshu-redraw",
+  "displayName": "转绘短剧工厂",
+  "version": "0.1.0",
+  "description": "转绘短剧工厂：以无限画布承载短剧分镜与镜头，支持分镜写入、连线编排与选中反馈",
+  "runtime": "agent",
+  "entry": "dist/index.js",
+  "capabilities": [
+    "tools"
+  ],
+  "contributes": {
+    "tools": [
+      {
+        "name": "redraw_open",
+        "description": "启动/复用本工作区的本地画布服务并返回可在浏览器打开的 URL"
+      },
+      {
+        "name": "redraw_upsert_shot",
+        "description": "新增或更新画布上的镜头节点（写入分镜内容，或仅改标题/位置/尺寸）"
+      },
+      {
+        "name": "redraw_get_state",
+        "description": "读取画布状态：镜头节点、连线、用户当前选中项与画布 URL"
+      },
+      {
+        "name": "redraw_arrange",
+        "description": "编排画布：删除/复制镜头节点、镜头间连线或取消连线"
+      }
+    ],
+    "lifecycle": [],
+    "skills": [
+      "skills"
+    ]
+  },
+  "permissions": {
+    "fs": true,
+    "net": true,
+    "shell": false
+  }
+}

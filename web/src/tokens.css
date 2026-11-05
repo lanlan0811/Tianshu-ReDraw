@@ -1,0 +1,41 @@
+/**
+ * 设计令牌（深黑主题，单一事实来源）。
+ * 短剧工厂：深黑画布 + 暖橙强调色，镜头卡像胶片格。
+ */
+:root {
+  /* 背景层次：从最深的画布底到卡片面 */
+  --rd-bg: #08090b;
+  --rd-bg-grid: #16181d;
+  --rd-surface: #0e1014;
+  --rd-surface-2: #14171d;
+  --rd-surface-3: #1b1f27;
+  --rd-border: #262b33;
+  --rd-border-strong: #343b46;
+
+  /* 文字 */
+  --rd-text: #e6e8ec;
+  --rd-text-dim: #9aa3b2;
+  --rd-text-faint: #6b7484;
+
+  /* 强调色（暖橙，像片场灯光） */
+  --rd-accent: #ff6a3d;
+  --rd-accent-soft: rgba(255, 106, 61, 0.14);
+  --rd-accent-line: rgba(255, 106, 61, 0.55);
+  --rd-accent-2: #ffb347;
+
+  /* 状态 */
+  --rd-danger: #ff5a5a;
+  --rd-ok: #46c98b;
+
+  /* 几何 */
+  --rd-radius: 10px;
+  --rd-radius-sm: 7px;
+  --rd-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
+  --rd-shadow-sm: 0 4px 14px rgba(0, 0, 0, 0.45);
+
+  /* 字体 */
+  --rd-font: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --rd-font-mono: ui-monospace, "SFMono-Regular", "Cascadia Mono", Consolas, monospace;
+
+  color-scheme: dark;
+}

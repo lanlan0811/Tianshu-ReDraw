@@ -1,48 +1,126 @@
 /**
- * 与本地画布服务通信：拉项目、提交视口、选中、镜头/连线编排、订阅 SSE。
+ * 与本地画布服务通信（v2）：项目/配置/流水线/帧/任务 + SSE。
  */
-export interface ApiShotNode {
-  id: string
-  type: 'shot'
-  title: string
-  x: number
-  y: number
-  width: number
-  height: number
-  aspect: string
-  contentPath: string
-  contentRev?: number
+export type StepId = 'frames' | 'localize' | 'script' | 'shotlist' | 'assets' | 'generate'
+export type AssetKind = 'character' | 'prop' | 'scene'
+export type BoardKind = 'single' | 'firstLast' | 'grid'
+export type GridMode = 'multiShot' | 'subPanels'
+
+export interface MediaRef {
+  path: string
+  rev: number
+  generatedAt: number
+  vendorId: string
+  modelName: string
+  mime: string
 }
 
-export interface ApiEdge {
+export interface FrameItem {
   id: string
-  source: string
-  target: string
-  label?: string
+  index: number
+  tSec: number
+  path: string
+  width: number
+  height: number
+  selected: boolean
+  tags?: string[]
+}
+
+export interface ShotItem {
+  id: string
+  index: number
+  episodeId: string
+  durationSec: number
+  shotSize: string
+  cameraMove: string
+  scene: string
+  characters: string[]
+  props: string[]
+  description: string
+  dialogue?: string
+  voiceover?: string
+  emotion?: string
+  boardIds: string[]
+  videoIds: string[]
+  status: string
+}
+
+export interface AssetItem {
+  id: string
+  kind: AssetKind
+  name: string
+  spec: string
+  prompt: string
+  baseImage?: MediaRef
+  variants: { id: string; name: string; prompt: string; image?: MediaRef; status: string }[]
+  status: string
+}
+
+export interface BoardItem {
+  id: string
+  shotId: string
+  kind: BoardKind
+  gridMode?: GridMode
+  image?: MediaRef
+  panels?: { index: number; image?: MediaRef }[]
+  status: string
+}
+
+export interface VideoSegment {
+  id: string
+  shotId: string
+  prompt: string
+  vendorId: string
+  modelName: string
+  durationSec: number
+  resolution: string
+  output?: MediaRef
+  status: string
+}
+
+export interface Gate {
+  asked: boolean
+  answered: boolean
+  question?: string
+  answer?: string
 }
 
 export interface ApiProject {
-  version: 1
-  viewport: { x: number; y: number; zoom: number }
-  shots: ApiShotNode[]
-  edges: ApiEdge[]
-  /** 项目文件有问题时的提示。 */
-  issue?: string
-}
-
-export interface ApiSelection {
-  shotId: string
-  kind: 'shot' | 'element'
-  element?: {
-    xpath: string
-    tagName: string
-    textContent?: string
-    computedStyles?: Record<string, string>
+  version: 2
+  meta: { id: string; title: string; aspect: string; episodeCount: number; region?: string }
+  source: { mode: 'video' | 'story'; videoPath?: string; story?: string; durationSec?: number }
+  frames: FrameItem[]
+  style: { styleId: string; promptFragment?: string }
+  localization: { region: string; templateId: string; report?: { region: string; checklist: Record<string, string> } }
+  script: { status: string; episodes: unknown[]; revisions: number }
+  shots: ShotItem[]
+  assets: AssetItem[]
+  boards: BoardItem[]
+  videos: VideoSegment[]
+  pipeline: {
+    currentStep: StepId
+    steps: Record<StepId, { status: string; gate?: Gate }>
+    globalPrefs: { boardType?: BoardKind; gridMode?: GridMode; videoModel?: { vendorId: string; modelName: string }; videoSeconds?: number }
   }
-  at: number
+  viewport: { x: number; y: number; zoom: number }
+  edges: { id: string; source: string; target: string; label?: string }[]
+  layout: Record<string, { x: number; y: number }>
+  extractRequest?: { intervalSec: number; status: string; at: number; message?: string }
+  jobs?: JobView[]
+  issue?: string
+  gate?: { step: StepId; question?: string } | null
 }
 
-const MUTATION_HEADERS = { 'Content-Type': 'application/json', 'X-Tianshu-Redraw': '1' }
+export interface JobView {
+  id: string
+  kind: string
+  status: string
+  progress: number
+  message: string
+  error?: string
+}
+
+const HDR = { 'Content-Type': 'application/json', 'X-Tianshu-Redraw': '1' }
 
 export async function fetchProject(ws: string): Promise<ApiProject> {
   const res = await fetch(`/api/project?ws=${encodeURIComponent(ws)}`)
@@ -50,90 +128,77 @@ export async function fetchProject(ws: string): Promise<ApiProject> {
   return (await res.json()) as ApiProject
 }
 
-export async function fetchSelection(ws: string): Promise<ApiSelection | null> {
-  const res = await fetch(`/api/selection?ws=${encodeURIComponent(ws)}`)
-  if (!res.ok) return null
-  const data = (await res.json()) as { selection: ApiSelection | null }
-  return data.selection
+export async function fetchConfig(ws: string): Promise<unknown> {
+  const res = await fetch(`/api/config?ws=${encodeURIComponent(ws)}`)
+  return res.ok ? res.json() : null
 }
 
-let viewportTimer: ReturnType<typeof setTimeout> | undefined
-
+let vpTimer: ReturnType<typeof setTimeout> | undefined
 export function postViewport(ws: string, vp: { x: number; y: number; zoom: number }): void {
-  clearTimeout(viewportTimer)
-  viewportTimer = setTimeout(() => {
-    void fetch('/api/viewport', {
-      method: 'POST',
-      headers: MUTATION_HEADERS,
-      body: JSON.stringify({ ws, ...vp }),
-    }).catch(() => {
-      /* ignore */
-    })
+  clearTimeout(vpTimer)
+  vpTimer = setTimeout(() => {
+    void fetch('/api/viewport', { method: 'POST', headers: HDR, body: JSON.stringify({ ws, ...vp }) }).catch(() => {})
   }, 500)
 }
 
-export async function postSelection(
+export async function postSelection(ws: string, kind: string, id?: string): Promise<void> {
+  await fetch('/api/selection', { method: 'POST', headers: HDR, body: JSON.stringify({ ws, kind, id }) }).catch(() => {})
+}
+
+export async function postPipeline(ws: string, op: 'set_step' | 'answer_gate', data: Record<string, unknown>): Promise<void> {
+  await fetch('/api/pipeline', { method: 'POST', headers: HDR, body: JSON.stringify({ ws, op, ...data }) }).catch(() => {})
+}
+
+export async function postConfig(ws: string, patch: unknown): Promise<void> {
+  await fetch('/api/config', { method: 'POST', headers: HDR, body: JSON.stringify({ ws, patch }) }).catch(() => {})
+}
+
+export async function postEdge(ws: string, op: 'add' | 'remove', source: string, target: string): Promise<void> {
+  await fetch('/api/edges', { method: 'POST', headers: HDR, body: JSON.stringify({ ws, op, source, target }) }).catch(() => {})
+}
+
+/** 抽帧：逐帧上传（每帧一请求，避 body 上限）。 */
+export async function postFrame(
   ws: string,
-  shotId: string,
-  kind: 'shot' | 'element',
-  payload?: Record<string, unknown>,
+  frame: { index: number; tSec: number; data: string; width: number; height: number },
 ): Promise<void> {
-  await fetch('/api/selection', {
-    method: 'POST',
-    headers: MUTATION_HEADERS,
-    body: JSON.stringify({ ws, shotId, kind, payload }),
-  }).catch(() => {
-    /* ignore */
-  })
+  await fetch('/api/frames', { method: 'POST', headers: HDR, body: JSON.stringify({ ws, op: 'add', ...frame }) })
 }
 
-export type ShotOp = 'remove' | 'rename' | 'duplicate' | 'move'
-
-export async function postShotOp(
-  ws: string,
-  op: ShotOp,
-  data: { id: string; title?: string; x?: number; y?: number },
-): Promise<ApiShotNode | null> {
-  const res = await fetch('/api/shots', {
-    method: 'POST',
-    headers: MUTATION_HEADERS,
-    body: JSON.stringify({ ws, op, ...data }),
-  })
-  if (!res.ok) return null
-  const body = (await res.json()) as { shot?: ApiShotNode }
-  return body.shot ?? null
+export async function postContactSheet(ws: string, data: string, width: number, height: number): Promise<void> {
+  await fetch('/api/frames/contact', { method: 'POST', headers: HDR, body: JSON.stringify({ ws, data, width, height }) })
 }
 
-export async function postEdge(
-  ws: string,
-  op: 'add' | 'remove',
-  source: string,
-  target: string,
-  label?: string,
-): Promise<void> {
-  await fetch('/api/edges', {
-    method: 'POST',
-    headers: MUTATION_HEADERS,
-    body: JSON.stringify({ ws, op, source, target, label }),
-  }).catch(() => {
-    /* ignore */
-  })
+export async function postFramesStatus(ws: string, status: string, message?: string): Promise<void> {
+  await fetch('/api/frames/status', { method: 'POST', headers: HDR, body: JSON.stringify({ ws, status, message }) }).catch(() => {})
 }
 
-export function shotUrl(ws: string, id: string, rev?: number): string {
-  const base = `/shot/${encodeURIComponent(id)}?ws=${encodeURIComponent(ws)}`
-  return rev === undefined ? base : `${base}&rev=${rev}`
+export async function clearFrames(ws: string): Promise<void> {
+  await fetch('/api/frames', { method: 'POST', headers: HDR, body: JSON.stringify({ ws, op: 'clear' }) }).catch(() => {})
+}
+
+export function mediaUrl(ws: string, relPath: string): string {
+  return `/api/media?ws=${encodeURIComponent(ws)}&path=${encodeURIComponent(relPath)}`
+}
+
+export function sourceVideoUrl(ws: string): string {
+  return `/api/source-video?ws=${encodeURIComponent(ws)}`
 }
 
 export interface EventHandlers {
   onProject?: () => void
+  onFrames?: () => void
+  onJob?: () => void
+  onConfig?: () => void
   onSelection?: () => void
 }
 
-/** 单一 EventSource，同时订阅 project / selection 两类事件。 */
 export function subscribeEvents(ws: string, handlers: EventHandlers): () => void {
   const es = new EventSource(`/api/events?ws=${encodeURIComponent(ws)}`)
   if (handlers.onProject) es.addEventListener('project', handlers.onProject)
+  if (handlers.onFrames) es.addEventListener('frames', handlers.onFrames)
+  if (handlers.onJob) es.addEventListener('job', handlers.onJob)
+  if (handlers.onConfig) es.addEventListener('config', handlers.onConfig)
   if (handlers.onSelection) es.addEventListener('selection', handlers.onSelection)
   return () => es.close()
 }

@@ -3,33 +3,53 @@
   "kind": "tianshu.plugin",
   "id": "tianshu-redraw",
   "displayName": "转绘短剧工厂",
-  "version": "0.1.0",
-  "description": "转绘短剧工厂：以无限画布承载短剧分镜与镜头，支持分镜写入、连线编排与选中反馈",
+  "version": "0.2.0",
+  "description": "转绘短剧工厂：抽帧看片 → 风格本土化 → 剧本分镜 → 资产分配 → 分镜图 → 视频生成的端到端流水线，无限画布承载",
   "runtime": "agent",
   "entry": "dist/index.js",
   "capabilities": [
-    "tools"
+    "tools",
+    "storage",
+    "sidePathLLM",
+    "promptContext"
   ],
   "contributes": {
     "tools": [
-      {
-        "name": "redraw_open",
-        "description": "启动/复用本工作区的本地画布服务并返回可在浏览器打开的 URL"
-      },
-      {
-        "name": "redraw_upsert_shot",
-        "description": "新增或更新画布上的镜头节点（写入分镜内容，或仅改标题/位置/尺寸）"
-      },
-      {
-        "name": "redraw_get_state",
-        "description": "读取画布状态：镜头节点、连线、用户当前选中项与画布 URL"
-      },
-      {
-        "name": "redraw_arrange",
-        "description": "编排画布：删除/复制镜头节点、镜头间连线或取消连线"
-      }
+      { "name": "redraw_open", "description": "启动/复用本地画布服务并返回浏览器 URL" },
+      { "name": "redraw_get_state", "description": "读取流程进度、门控、计数、任务与选中状态" },
+      { "name": "redraw_config_get", "description": "读取工作区配置（密钥脱敏）与适配文件列表" },
+      { "name": "redraw_config_set", "description": "写入供应商/模型/密钥/信任配置" },
+      { "name": "redraw_vendor_list", "description": "列出工作区供应商适配文件及其模型" },
+      { "name": "redraw_vendor_validate", "description": "校验供应商适配文件能否加载" },
+      { "name": "redraw_style_list", "description": "列出内置与自定义转绘风格" },
+      { "name": "redraw_style_set", "description": "锁定项目级转绘风格" },
+      { "name": "redraw_frames_ingest", "description": "接收视频素材或文本剧情" },
+      { "name": "redraw_frames_extract", "description": "提交抽帧请求（浏览器 ffmpeg.wasm 执行）" },
+      { "name": "redraw_frames_list", "description": "列出抽帧结果与宫格总览图路径" },
+      { "name": "redraw_localize_set", "description": "记录目标地区与结构化本土化报告" },
+      { "name": "redraw_localize_get", "description": "读取本土化报告" },
+      { "name": "redraw_script_upsert", "description": "写入/修订剧本草稿" },
+      { "name": "redraw_script_get", "description": "读取当前剧本" },
+      { "name": "redraw_script_approve", "description": "批准剧本" },
+      { "name": "redraw_shotlist_upsert", "description": "写入/修订分镜表" },
+      { "name": "redraw_shotlist_get", "description": "读取当前分镜表" },
+      { "name": "redraw_shotlist_approve", "description": "批准分镜表" },
+      { "name": "redraw_assets_upsert", "description": "写入资产设定、提示词与变体" },
+      { "name": "redraw_assets_list", "description": "列出资产、变体与图片路径" },
+      { "name": "redraw_assets_generate", "description": "生成资产基础图或变体图" },
+      { "name": "redraw_boards_plan", "description": "记录分镜图类型与宫格偏好" },
+      { "name": "redraw_boards_generate", "description": "生成分镜图（单帧/首尾帧/宫格）" },
+      { "name": "redraw_video_generate", "description": "为镜头生成一段视频（逐段不拼接）" },
+      { "name": "redraw_job_status", "description": "查询任务状态与产出路径" },
+      { "name": "redraw_job_cancel", "description": "取消进行中的任务" },
+      { "name": "redraw_add_edge", "description": "在画布上为两个节点连线" }
     ],
-    "lifecycle": [],
+    "lifecycle": [
+      "turnStart",
+      "toolEnd",
+      "turnEnd",
+      "sessionEnd"
+    ],
     "skills": [
       "skills"
     ]
@@ -37,6 +57,6 @@
   "permissions": {
     "fs": true,
     "net": true,
-    "shell": false
+    "shell": true
   }
 }

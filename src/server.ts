@@ -10,40 +10,46 @@
  * 安全：
  *  - 只绑定 127.0.0.1；校验 Host 头。
  *  - 静态资源白名单（非目录遍历）。
- *  - 分镜 HTML 视为不可信：iframe 无 allow-same-origin + `/shot/:id` 严格 CSP + nosniff。
  *  - 变更路由要求自定义头 `X-Tianshu-Redraw: 1`（跨源无法带自定义头 → 天然防 CSRF）。
+ *  - 源视频流式 + Range 支持（ffmpeg 需 seek）。
  */
 import http from 'node:http'
 import { createHash } from 'node:crypto'
-import { existsSync, readFileSync } from 'node:fs'
+import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { assertSafeId, InvalidInputError } from './ids.js'
+import { assertSafeId, InvalidInputError, newFrameId } from './ids.js'
+import { readConfig, redactConfig, updateConfig } from './config.js'
+import { activeJobs, jobEvents } from './jobs.js'
 import {
+  STEP_IDS,
   addEdge,
-  duplicateShot,
-  moveShot,
+  contactDir,
+  framesDir,
+  mediaAbs,
+  mimeFromExt,
+  mutateProject,
+  pendingGate,
   projectEvents,
   projectIssue,
   readProject,
   readSelection,
-  readShotHtml,
   removeEdge,
-  removeShot,
-  renameShot,
   setViewport,
+  writeMedia,
   writeSelection,
+  type FrameItem,
   type Selection,
+  type StepId,
 } from './project.js'
 
 const WEB_DIR = fileURLToPath(new URL('./web/', import.meta.url))
+const FFMPEG_DIR = fileURLToPath(new URL('./ffmpeg/', import.meta.url))
 
 const DEFAULT_PORT = 43187
 const MUTATION_HEADER = 'x-tianshu-redraw'
-const MAX_BODY = 4 * 1024 * 1024
-/** 视口请求体很小，沿用比通用 JSON 更紧的上限。 */
+const MAX_BODY = 8 * 1024 * 1024
 const MAX_VIEWPORT_BODY = 4096
-/** 超限响应发出后，最多再等这么久让客户端发完请求体。 */
 const BODY_DRAIN_MS = 2000
 
 interface ServerState {
@@ -102,12 +108,11 @@ export async function ensureServer(cwd: string, preferredPort = DEFAULT_PORT): P
     server.unref()
     const created: ServerState = { server, port, tokens: new Map(), sse: new Map() }
     state = created
-    projectEvents.on('change', ({ cwd: changed }: { cwd: string }) => {
-      broadcast(created, tokenFor(changed), 'project')
-    })
-    projectEvents.on('selection', ({ cwd: changed }: { cwd: string }) => {
-      broadcast(created, tokenFor(changed), 'selection')
-    })
+    for (const evt of ['change', 'selection', 'job', 'pipeline', 'frames', 'config']) {
+      const name = evt === 'change' ? 'project' : evt
+      projectEvents.on(evt, ({ cwd: changed }: { cwd: string }) => broadcast(created, tokenFor(changed), name))
+    }
+    jobEvents.on('job', ({ cwd: changed }: { cwd: string }) => broadcast(created, tokenFor(changed), 'job'))
   }
   const token = tokenFor(cwd)
   state.tokens.set(token, cwd)
@@ -145,6 +150,7 @@ export async function shutdownForTests(): Promise<void> {
 const ASSET_TYPES: Record<string, string> = {
   'canvas.js': 'application/javascript; charset=utf-8',
   'canvas.css': 'text/css; charset=utf-8',
+  'frames-worker.js': 'application/javascript; charset=utf-8',
   'canvas.js.map': 'application/json; charset=utf-8',
 }
 
@@ -152,9 +158,7 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
   try {
     routeRequest(req, res)
   } catch (err) {
-    // 同步异常（例如读分镜文件失败）不能打垮进程。
     console.error('[tianshu-redraw] 请求处理失败：', err)
-    // 响应头已发出时无法再改状态码，只能断开，否则客户端会一直挂起。
     if (res.headersSent) res.destroy()
     else send(res, 500, 'text/plain; charset=utf-8', 'internal error')
   }
@@ -162,10 +166,7 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
 
 function routeRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
   const host = req.headers.host
-  if (!host || !isLocalHost(host)) {
-    return send(res, 403, 'text/plain; charset=utf-8', 'forbidden host')
-  }
-  // 基址只用于解析路径和查询串。'//' 这样的请求路径会让 new URL 抛错。
+  if (!host || !isLocalHost(host)) return send(res, 403, 'text/plain; charset=utf-8', 'forbidden host')
   let url: URL
   try {
     url = new URL(req.url ?? '/', 'http://127.0.0.1')
@@ -174,13 +175,8 @@ function routeRequest(req: http.IncomingMessage, res: http.ServerResponse): void
   }
   const path = url.pathname
 
-  if (req.method === 'GET' && path === '/healthz') {
-    return send(res, 200, 'text/plain; charset=utf-8', 'ok')
-  }
-
-  if (req.method === 'GET' && path === '/') {
-    return serveStatic(res, 'index.html')
-  }
+  if (req.method === 'GET' && path === '/healthz') return send(res, 200, 'text/plain; charset=utf-8', 'ok')
+  if (req.method === 'GET' && path === '/') return serveStatic(res, 'index.html')
 
   if (req.method === 'GET' && path.startsWith('/assets/')) {
     const name = path.slice('/assets/'.length)
@@ -188,11 +184,26 @@ function routeRequest(req: http.IncomingMessage, res: http.ServerResponse): void
     return send(res, 404, 'text/plain; charset=utf-8', 'not found')
   }
 
+  // ffmpeg wasm 核心（提交进仓库，离线可用）
+  if (req.method === 'GET' && path.startsWith('/ffmpeg/')) {
+    const name = path.slice('/ffmpeg/'.length)
+    if (!/^[A-Za-z0-9._-]+$/.test(name)) return send(res, 400, 'text/plain; charset=utf-8', 'bad name')
+    const type = name.endsWith('.wasm') ? 'application/wasm' : name.endsWith('.js') ? 'application/javascript; charset=utf-8' : 'application/octet-stream'
+    return serveFile(res, join(FFMPEG_DIR, name), type)
+  }
+
   if (req.method === 'GET' && path === '/api/project') {
     const cwd = resolveCwd(url.searchParams.get('ws'))
     if (!cwd) return send(res, 404, 'application/json; charset=utf-8', JSON.stringify({ error: 'unknown workspace' }))
     const issue = projectIssue(cwd)
-    return sendJson(res, { ...readProject(cwd), ...(issue ? { issue } : {}) })
+    const p = readProject(cwd)
+    return sendJson(res, { ...p, jobs: activeJobs(cwd).map(jobView), ...(issue ? { issue } : {}), gate: pendingGate(p) })
+  }
+
+  if (req.method === 'GET' && path === '/api/config') {
+    const cwd = resolveCwd(url.searchParams.get('ws'))
+    if (!cwd) return send(res, 404, 'application/json; charset=utf-8', JSON.stringify({ error: 'unknown workspace' }))
+    return sendJson(res, redactConfig(readConfig(cwd)))
   }
 
   if (req.method === 'GET' && path === '/api/events') {
@@ -201,20 +212,26 @@ function routeRequest(req: http.IncomingMessage, res: http.ServerResponse): void
     return handleSse(res, tokenFor(cwd))
   }
 
-  if (req.method === 'GET' && path.startsWith('/shot/')) {
+  // 帧图片（抽帧结果 / 宫格总览）
+  if (req.method === 'GET' && path === '/api/media') {
     const cwd = resolveCwd(url.searchParams.get('ws'))
     if (!cwd) return send(res, 404, 'text/plain; charset=utf-8', 'unknown workspace')
-    let id: string
-    try {
-      id = decodeURIComponent(path.slice('/shot/'.length))
-    } catch (err) {
-      // 畸形百分号编码会抛 URIError；不能让它变成未捕获异常。
-      if (err instanceof URIError) return send(res, 400, 'text/plain; charset=utf-8', 'bad shot id')
-      throw err
-    }
-    const html = readShotHtml(cwd, id)
-    if (html === null) return send(res, 404, 'text/plain; charset=utf-8', 'shot not found')
-    return sendUntrustedHtml(res, decorateShotHtml(html))
+    const rel = url.searchParams.get('path') ?? ''
+    // 只允许 .tianshu-redraw/ 下的相对路径，且无 ..
+    if (!rel.startsWith('.tianshu-redraw/') || rel.includes('..')) return send(res, 400, 'text/plain; charset=utf-8', 'bad path')
+    const abs = mediaAbs(cwd, rel)
+    if (!existsSync(abs)) return send(res, 404, 'text/plain; charset=utf-8', 'not found')
+    const ext = rel.match(/\.([A-Za-z0-9]+)$/)?.[1] ?? ''
+    return serveFile(res, abs, mimeFromExt(ext))
+  }
+
+  // 源视频流（Range 支持）
+  if (req.method === 'GET' && path === '/api/source-video') {
+    const cwd = resolveCwd(url.searchParams.get('ws'))
+    if (!cwd) return send(res, 404, 'text/plain; charset=utf-8', 'unknown workspace')
+    const p = readProject(cwd)
+    if (p.source.mode !== 'video' || !p.source.videoPath) return send(res, 404, 'text/plain; charset=utf-8', 'no source video')
+    return streamVideo(req, res, mediaAbs(cwd, p.source.videoPath))
   }
 
   if (req.method === 'GET' && path === '/api/selection') {
@@ -223,21 +240,15 @@ function routeRequest(req: http.IncomingMessage, res: http.ServerResponse): void
     return sendJson(res, { selection: readSelection(cwd) })
   }
 
-  if (req.method === 'GET' && path === '/api/shot-html') {
-    const cwd = resolveCwd(url.searchParams.get('ws'))
-    if (!cwd) return send(res, 404, 'text/plain; charset=utf-8', 'unknown workspace')
-    const html = readShotHtml(cwd, url.searchParams.get('id') ?? '')
-    if (html === null) return send(res, 404, 'text/plain; charset=utf-8', 'shot not found')
-    return send(res, 200, 'text/plain; charset=utf-8', html)
-  }
-
   if (req.method === 'POST') {
-    if (String(req.headers[MUTATION_HEADER] ?? '') !== '1') {
-      return send(res, 403, 'text/plain; charset=utf-8', 'missing header')
-    }
+    if (String(req.headers[MUTATION_HEADER] ?? '') !== '1') return send(res, 403, 'text/plain; charset=utf-8', 'missing header')
     if (path === '/api/viewport') return handleViewport(req, res)
     if (path === '/api/selection') return handleSelection(req, res)
-    if (path === '/api/shots') return handleShots(req, res)
+    if (path === '/api/pipeline') return handlePipeline(req, res)
+    if (path === '/api/config') return handleConfig(req, res)
+    if (path === '/api/frames') return handleFrames(req, res)
+    if (path === '/api/frames/contact') return handleContactSheet(req, res)
+    if (path === '/api/frames/status') return handleFramesStatus(req, res)
     if (path === '/api/edges') return handleEdges(req, res)
   }
 
@@ -245,7 +256,7 @@ function routeRequest(req: http.IncomingMessage, res: http.ServerResponse): void
 }
 
 // ---------------------------------------------------------------------------
-// 变更路由（body 读取 + 分发）
+// 变更路由
 // ---------------------------------------------------------------------------
 
 function readJsonBody(
@@ -257,17 +268,13 @@ function readJsonBody(
   let raw = ''
   let rejected = false
   req.setEncoding('utf8')
-  req.on('error', () => {
-    /* 客户端断开，或超限后 destroy */
-  })
+  req.on('error', () => {})
   req.on('data', (chunk: string) => {
     if (rejected) return
     raw += chunk
     if (raw.length > maxBytes) {
       rejected = true
       raw = ''
-      // 带着未读数据断开时系统会发 RST，客户端读不到 413（Windows 上必现）。
-      // 所以继续读取并丢弃剩余数据；对方迟迟发不完才断开，避免连接被无限占用。
       const drain = setTimeout(() => req.destroy(), BODY_DRAIN_MS)
       drain.unref()
       req.once('close', () => clearTimeout(drain))
@@ -282,20 +289,16 @@ function readJsonBody(
     } catch {
       return send(res, 400, 'application/json; charset=utf-8', JSON.stringify({ error: 'bad json' }))
     }
-    // JSON 合法不代表是对象：字面量 null 会让后面的属性读取抛错。
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
       return send(res, 400, 'application/json; charset=utf-8', JSON.stringify({ error: 'bad json' }))
     }
     const body = parsed as Record<string, unknown>
-    // 这里运行在 end 事件回调内，handleRequest 的 try/catch 接不住，所有变更路由在此统一兜底。
     try {
       const cwd = resolveCwd(typeof body.ws === 'string' ? body.ws : null)
       if (!cwd) return send(res, 404, 'application/json; charset=utf-8', JSON.stringify({ error: 'unknown workspace' }))
       onBody({ ...body, __cwd: cwd })
     } catch (err) {
-      if (err instanceof InvalidInputError) {
-        return send(res, 400, 'application/json; charset=utf-8', JSON.stringify({ error: err.message }))
-      }
+      if (err instanceof InvalidInputError) return send(res, 400, 'application/json; charset=utf-8', JSON.stringify({ error: err.message }))
       console.error('[tianshu-redraw] 请求处理失败：', err)
       if (res.headersSent) res.destroy()
       else send(res, 500, 'application/json; charset=utf-8', JSON.stringify({ error: 'internal error' }))
@@ -306,60 +309,119 @@ function readJsonBody(
 function handleSelection(req: http.IncomingMessage, res: http.ServerResponse): void {
   readJsonBody(req, res, (body) => {
     const cwd = String(body.__cwd)
-    const shotId = typeof body.shotId === 'string' ? body.shotId : ''
-    const kind = body.kind === 'shot' ? 'shot' : 'element'
-    if (!shotId) return send(res, 400, 'application/json; charset=utf-8', JSON.stringify({ error: 'missing shotId' }))
-    assertSafeId(shotId)
-    const raw = body.payload as Record<string, unknown> | undefined
-    const selection: Selection = {
-      shotId,
-      kind,
-      at: Date.now(),
-      ...(kind === 'element' && raw
-        ? {
-            element: {
-              xpath: String(raw.xpath ?? ''),
-              tagName: String(raw.tagName ?? ''),
-              textContent: typeof raw.textContent === 'string' ? raw.textContent : undefined,
-              computedStyles:
-                raw.computedStyles && typeof raw.computedStyles === 'object'
-                  ? (raw.computedStyles as Record<string, string>)
-                  : undefined,
-            },
-          }
-        : {}),
-    }
+    const kind = String(body.kind ?? 'none')
+    const id = typeof body.id === 'string' ? body.id : undefined
+    if (id) assertSafeId(id)
+    const selection: Selection = { kind: (['shot', 'asset', 'board', 'video', 'frame'] as const).includes(kind as never) ? (kind as Selection['kind']) : 'none', ...(id ? { id } : {}), at: Date.now() }
     writeSelection(cwd, selection)
     return sendJson(res, { ok: true })
   })
 }
 
-function handleShots(req: http.IncomingMessage, res: http.ServerResponse): void {
+function handlePipeline(req: http.IncomingMessage, res: http.ServerResponse): void {
   readJsonBody(req, res, (body) => {
     const cwd = String(body.__cwd)
     const op = String(body.op ?? '')
-    const id = typeof body.id === 'string' ? body.id : ''
-    if (op === 'remove') {
-      if (!id) throw new InvalidInputError('missing id')
-      removeShot(cwd, id)
-      return sendJson(res, { ok: true, id })
+    if (op === 'set_step') {
+      const step = String(body.step ?? '')
+      if (!STEP_IDS.includes(step as StepId)) return send(res, 400, 'application/json; charset=utf-8', JSON.stringify({ error: 'bad step' }))
+      mutateProject(cwd, (p) => {
+        p.pipeline.currentStep = step as StepId
+      })
+      return sendJson(res, { ok: true })
     }
-    if (op === 'rename') {
-      if (!id || typeof body.title !== 'string') throw new InvalidInputError('missing id or title')
-      renameShot(cwd, id, body.title)
-      return sendJson(res, { ok: true, id, title: body.title })
-    }
-    if (op === 'move') {
-      if (!id) throw new InvalidInputError('missing id')
-      moveShot(cwd, id, Number(body.x) || 0, Number(body.y) || 0)
-      return sendJson(res, { ok: true, id })
-    }
-    if (op === 'duplicate') {
-      if (!id) throw new InvalidInputError('missing id')
-      const shot = duplicateShot(cwd, id, typeof body.title === 'string' ? body.title : undefined)
-      return sendJson(res, { ok: true, shot })
+    if (op === 'answer_gate') {
+      const step = String(body.step ?? '')
+      if (!STEP_IDS.includes(step as StepId)) return send(res, 400, 'application/json; charset=utf-8', JSON.stringify({ error: 'bad step' }))
+      mutateProject(cwd, (p) => {
+        const g = p.pipeline.steps[step as StepId].gate ?? { asked: true, answered: false }
+        p.pipeline.steps[step as StepId].gate = { ...g, asked: true, answered: true, answer: typeof body.answer === 'string' ? body.answer : 'approved' }
+      })
+      return sendJson(res, { ok: true })
     }
     return send(res, 400, 'application/json; charset=utf-8', JSON.stringify({ error: `unknown op: ${op}` }))
+  })
+}
+
+function handleConfig(req: http.IncomingMessage, res: http.ServerResponse): void {
+  readJsonBody(req, res, (body) => {
+    const cwd = String(body.__cwd)
+    const patch = (body.patch ?? {}) as Record<string, unknown>
+    const next = updateConfig(cwd, patch as Parameters<typeof updateConfig>[1])
+    return sendJson(res, redactConfig(next))
+  })
+}
+
+function handleFrames(req: http.IncomingMessage, res: http.ServerResponse): void {
+  readJsonBody(req, res, (body) => {
+    const cwd = String(body.__cwd)
+    const op = String(body.op ?? 'add')
+    if (op === 'add') {
+      const index = Number(body.index)
+      const tSec = Number(body.tSec)
+      const dataUri = String(body.data ?? '')
+      const m = /^data:image\/(\w+);base64,(.*)$/s.exec(dataUri)
+      if (!m) return send(res, 400, 'application/json; charset=utf-8', JSON.stringify({ error: 'bad image data' }))
+      const id = newFrameId()
+      const ext = m[1] === 'jpeg' ? 'jpg' : m[1]
+      const path = writeMedia(cwd, `frames/${id}.${ext}`, Buffer.from(m[2]!, 'base64'))
+      mutateProject(cwd, (p) => {
+        const frame: FrameItem = { id, index: Number.isFinite(index) ? index : p.frames.length, tSec: Number.isFinite(tSec) ? tSec : 0, path, width: Number(body.width) || 0, height: Number(body.height) || 0, selected: false }
+        p.frames.push(frame)
+      })
+      projectEvents.emit('frames', { cwd })
+      return sendJson(res, { ok: true, id, path })
+    }
+    if (op === 'select') {
+      const id = String(body.id ?? '')
+      if (id) assertSafeId(id)
+      mutateProject(cwd, (p) => {
+        const f = p.frames.find((x) => x.id === id)
+        if (f) f.selected = body.selected === true
+      })
+      return sendJson(res, { ok: true })
+    }
+    if (op === 'clear') {
+      mutateProject(cwd, (p) => {
+        p.frames = []
+        p.extractRequest = undefined
+      })
+      projectEvents.emit('frames', { cwd })
+      return sendJson(res, { ok: true })
+    }
+    return send(res, 400, 'application/json; charset=utf-8', JSON.stringify({ error: `unknown op: ${op}` }))
+  })
+}
+
+function handleContactSheet(req: http.IncomingMessage, res: http.ServerResponse): void {
+  readJsonBody(req, res, (body) => {
+    const cwd = String(body.__cwd)
+    const dataUri = String(body.data ?? '')
+    const m = /^data:image\/(\w+);base64,(.*)$/s.exec(dataUri)
+    if (!m) return send(res, 400, 'application/json; charset=utf-8', JSON.stringify({ error: 'bad image data' }))
+    const ext = m[1] === 'jpeg' ? 'jpg' : m[1]
+    const path = writeMedia(cwd, `frames/_contact/sheet-${Date.now()}.${ext}`, Buffer.from(m[2]!, 'base64'))
+    mutateProject(cwd, (p) => {
+      p.frames.push({ id: `sheet-${Date.now().toString(36)}`, index: -1, tSec: 0, path, width: Number(body.width) || 0, height: Number(body.height) || 0, selected: false })
+      if (p.extractRequest) p.extractRequest = { ...p.extractRequest, status: 'done', message: '抽帧完成' }
+      p.pipeline.steps.frames.status = 'done'
+    })
+    projectEvents.emit('frames', { cwd })
+    return sendJson(res, { ok: true, path })
+  })
+}
+
+function handleFramesStatus(req: http.IncomingMessage, res: http.ServerResponse): void {
+  readJsonBody(req, res, (body) => {
+    const cwd = String(body.__cwd)
+    const status = String(body.status ?? 'running')
+    const message = typeof body.message === 'string' ? body.message : undefined
+    mutateProject(cwd, (p) => {
+      if (p.extractRequest) p.extractRequest = { ...p.extractRequest, status: (status === 'error' ? 'error' : status === 'done' ? 'done' : 'running'), ...(message ? { message } : {}) }
+      if (status === 'error') p.pipeline.steps.frames.status = 'active'
+    })
+    projectEvents.emit('frames', { cwd })
+    return sendJson(res, { ok: true })
   })
 }
 
@@ -370,10 +432,7 @@ function handleEdges(req: http.IncomingMessage, res: http.ServerResponse): void 
     const source = typeof body.source === 'string' ? body.source : ''
     const target = typeof body.target === 'string' ? body.target : ''
     if (!source || !target) return send(res, 400, 'application/json; charset=utf-8', JSON.stringify({ error: 'missing source or target' }))
-    if (op === 'add') {
-      const edge = addEdge(cwd, source, target, typeof body.label === 'string' ? body.label : undefined)
-      return sendJson(res, { ok: true, edge })
-    }
+    if (op === 'add') return sendJson(res, { ok: true, edge: addEdge(cwd, source, target, typeof body.label === 'string' ? body.label : undefined) })
     if (op === 'remove') {
       removeEdge(cwd, source, target)
       return sendJson(res, { ok: true })
@@ -388,18 +447,56 @@ function handleViewport(req: http.IncomingMessage, res: http.ServerResponse): vo
     res,
     (body) => {
       const cwd = String(body.__cwd)
-      const x = Number(body.x)
-      const y = Number(body.y)
-      const zoom = Number(body.zoom)
-      setViewport(cwd, {
-        x: Number.isFinite(x) ? x : 0,
-        y: Number.isFinite(y) ? y : 0,
-        zoom: Number.isFinite(zoom) && zoom > 0 ? zoom : 1,
-      })
+      setViewport(cwd, { x: Number(body.x) || 0, y: Number(body.y) || 0, zoom: Number(body.zoom) > 0 ? Number(body.zoom) : 1 })
       return sendJson(res, { ok: true })
     },
     MAX_VIEWPORT_BODY,
   )
+}
+
+function jobView(j: { id: string; kind: string; status: string; progress: number; message: string; error?: string }): Record<string, unknown> {
+  return { id: j.id, kind: j.kind, status: j.status, progress: j.progress, message: j.message, ...(j.error ? { error: j.error } : {}) }
+}
+
+// ---------------------------------------------------------------------------
+// 流式 / 静态
+// ---------------------------------------------------------------------------
+
+function streamVideo(req: http.IncomingMessage, res: http.ServerResponse, abs: string): void {
+  if (!existsSync(abs) || !statSync(abs).isFile()) return send(res, 404, 'text/plain; charset=utf-8', 'not found')
+  const size = statSync(abs).size
+  const ext = abs.match(/\.([A-Za-z0-9]+)$/)?.[1] ?? 'mp4'
+  const type = mimeFromExt(ext)
+  const range = req.headers.range
+  if (range) {
+    const m = /bytes=(\d*)-(\d*)/.exec(range)
+    if (m) {
+      const start = m[1] ? Number(m[1]) : 0
+      const end = m[2] ? Number(m[2]) : size - 1
+      if (start >= size || end >= size || start > end) {
+        res.writeHead(416, { 'Content-Range': `bytes */${size}` })
+        res.end()
+        return
+      }
+      res.writeHead(206, {
+        'Content-Type': type,
+        'Content-Length': String(end - start + 1),
+        'Content-Range': `bytes ${start}-${end}/${size}`,
+        'Accept-Ranges': 'bytes',
+        'X-Content-Type-Options': 'nosniff',
+      })
+      createReadStream(abs, { start, end }).pipe(res)
+      return
+    }
+  }
+  res.writeHead(200, { 'Content-Type': type, 'Content-Length': String(size), 'Accept-Ranges': 'bytes', 'X-Content-Type-Options': 'nosniff' })
+  createReadStream(abs).pipe(res)
+}
+
+function serveFile(res: http.ServerResponse, abs: string, type: string): void {
+  if (!existsSync(abs) || !statSync(abs).isFile()) return send(res, 404, 'text/plain; charset=utf-8', 'not found')
+  res.writeHead(200, { 'Content-Type': type, 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-store' })
+  createReadStream(abs).pipe(res)
 }
 
 // ---------------------------------------------------------------------------
@@ -469,36 +566,10 @@ function serveStatic(res: http.ServerResponse, name: string, type = 'text/html; 
   const headers: Record<string, string> = { 'Content-Type': type, 'X-Content-Type-Options': 'nosniff' }
   if (name === 'index.html') {
     headers['Content-Security-Policy'] =
-      "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'"
+      "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; worker-src 'self' blob:; child-src 'self' blob:"
   }
   res.writeHead(200, headers)
   res.end(readFileSync(file))
-}
-
-/**
- * 为分镜卡注入一层基础样式：深黑底 + 去边距，使未显式设置背景的卡片融入画布深黑主题。
- * 仅作为默认值——作者样式（更具体的选择器）仍可覆盖。
- */
-const SHOT_BASE_STYLE =
-  '<style>html,body{margin:0;background:#0b0d10;color:#e6e8ec;font-family:system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}</style>'
-
-function decorateShotHtml(html: string): string {
-  if (/<\/head>/i.test(html)) return html.replace(/<\/head>/i, `${SHOT_BASE_STYLE}</head>`)
-  const bodyOpen = html.match(/<body[^>]*>/i)
-  if (bodyOpen) return html.replace(bodyOpen[0], `${bodyOpen[0]}${SHOT_BASE_STYLE}`)
-  return SHOT_BASE_STYLE + html
-}
-
-function sendUntrustedHtml(res: http.ServerResponse, html: string): void {
-  res.writeHead(200, {
-    'Content-Type': 'text/html; charset=utf-8',
-    'X-Content-Type-Options': 'nosniff',
-    'Cache-Control': 'no-store',
-    'Content-Security-Policy':
-      "default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'; " +
-      "script-src 'unsafe-inline' 'unsafe-eval'; font-src data:; connect-src 'none'; form-action 'none'",
-  })
-  res.end(html)
 }
 
 function sendJson(res: http.ServerResponse, body: unknown): void {
@@ -509,3 +580,5 @@ function send(res: http.ServerResponse, status: number, type: string, body: stri
   res.writeHead(status, { 'Content-Type': type, 'X-Content-Type-Options': 'nosniff' })
   res.end(body)
 }
+
+export { contactDir, framesDir }

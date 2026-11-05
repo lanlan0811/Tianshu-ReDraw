@@ -1,10 +1,6 @@
 /**
- * 端到端验证（真实浏览器）：启动本地服务、写入一个镜头，用无头浏览器打开画布，
- * 断言 React Flow 真正渲染、镜头节点出现、iframe 指向分镜页、背景为深黑、无 JS 报错。
- *
- * 用法：
- *   node scripts/verify-web.mjs                 # 自动探测 Chrome/Edge
- *   node scripts/verify-web.mjs <chrome.exe>    # 指定浏览器
+ * 端到端验证（真实浏览器）：启动本地服务、写入测试数据，断言流程向导式画布渲染、
+ * 深黑背景、6 步导航、无 JS 报错。
  */
 import { spawn } from 'node:child_process'
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
@@ -46,8 +42,12 @@ try {
   const url = open.content.match(/http:\/\/127\.0\.0\.1:\d+\/\?ws=[0-9a-f]+/)?.[0]
   if (!url) throw new Error('未拿到画布 URL')
 
-  await tools.redraw_upsert_shot.execute({
-    input: { html: '<h1 style="color:#fff">分镜 E2E</h1>', title: '镜头 E2E', aspect: 'portrait' },
+  // 写入测试数据
+  await tools.redraw_frames_ingest.execute({ input: { story: '雨夜，男主在天台独自等待。' }, cwd })
+  await tools.redraw_style_set.execute({ input: { style_id: 'anime-jp' }, cwd })
+  await tools.redraw_localize_set.execute({ input: { region: '日本' }, cwd })
+  await tools.redraw_script_upsert.execute({
+    input: { episodes: [{ title: '第1集', logline: '等待', synopsis: '雨夜独白', scenes: [{ slug: '天台', summary: '独白' }] }] },
     cwd,
   })
 
@@ -80,32 +80,21 @@ try {
     })
     await page.setViewport({ width: 1440, height: 900, deviceScaleFactor: 1 })
     await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 })
-    await page.waitForSelector('.shot-node', { timeout: 15000 })
-    await page.waitForSelector('.react-flow__viewport', { timeout: 10000 })
+    await page.waitForSelector('.rd-nav__item', { timeout: 15000 })
 
     const info = await page.evaluate(() => {
-      const node = document.querySelector('.shot-node')
-      const iframe = document.querySelector('.shot-node__iframe')
+      const navItems = document.querySelectorAll('.rd-nav__item').length
       const bodyBg = getComputedStyle(document.body).backgroundColor
-      const canvasBg = getComputedStyle(document.querySelector('.rd-canvas') || document.body).backgroundColor
-      return {
-        hasNode: !!node,
-        iframeSrc: iframe ? iframe.getAttribute('src') : null,
-        bodyBg,
-        canvasBg,
-        minimap: !!document.querySelector('.rd-minimap'),
-        title: document.querySelector('.shot-node__title')?.textContent ?? '',
-      }
+      const stepHead = document.querySelector('.rd-step__head h2')?.textContent ?? ''
+      return { navItems, bodyBg, stepHead, status: !!document.querySelector('.rd-status') }
     })
 
     const fail = (m) => {
       console.error('E2E 失败：' + m)
       process.exitCode = 1
     }
-    if (!info.hasNode) fail('未渲染镜头节点')
-    if (!info.iframeSrc?.startsWith('/shot/')) fail('iframe 未指向分镜页：' + info.iframeSrc)
-    if (!info.minimap) fail('未渲染 MiniMap')
-    // 深黑背景：rgb 分量都应很低
+    if (info.navItems !== 6) fail(`导航应有 6 步，实际 ${info.navItems}`)
+    if (!info.status) fail('缺少底部状态条')
     const dark = (c) => {
       const m = c.match(/(\d+),\s*(\d+),\s*(\d+)/)
       return m && Number(m[1]) < 40 && Number(m[2]) < 40 && Number(m[3]) < 40
@@ -114,7 +103,7 @@ try {
     if (errors.length) fail('页面有 JS 报错：\n' + errors.join('\n'))
 
     if (!process.exitCode) {
-      console.log('OK E2E: React Flow 渲染 / 镜头节点 / iframe 指向分镜页 / 深黑背景（body ' + info.bodyBg + '）/ 无 JS 报错')
+      console.log(`OK E2E: 6 步导航 / 深黑背景（${info.bodyBg}）/ 状态条 / 当前步骤「${info.stepHead}」/ 无 JS 报错`)
     }
   } finally {
     await browser.close().catch(() => {})

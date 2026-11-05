@@ -40,3 +40,7 @@ assert.ok(listJobs(cwd).length >= 3)
 
 resetJobsForTests()
 console.log('OK 任务: 成功/失败/取消/列表')
+
+// 显式退出：插件按设计持有长生命周期句柄（本地服务单例 / vendor 子进程），
+// node --test 每个文件独立进程，这里主动结束以避免测试进程挂住。
+process.exit(0)

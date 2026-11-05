@@ -41,3 +41,7 @@ const entry = pathToFileURL(join(root, 'dist', 'index.js')).href
     rmSync(cwd, { recursive: true, force: true })
   }
 }
+
+// 显式退出：插件按设计持有长生命周期句柄（本地服务单例 / vendor 子进程），
+// node --test 每个文件独立进程，这里主动结束以避免测试进程挂住。
+process.exit(0)
